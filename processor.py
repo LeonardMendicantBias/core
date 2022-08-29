@@ -3,6 +3,7 @@
 # import h5py
 
 import encodings
+import enum
 import os
 from unittest import result
 from xml.dom.minidom import Element
@@ -55,6 +56,9 @@ class H5Dataset(Dataset):
 
 class Processor:
 
+    class OrderedCounter(Counter, OrderedDict):
+        pass
+
     class Vocabulary:
         
         def __init__(self,
@@ -71,12 +75,20 @@ class Processor:
             self.w2i, self.i2w = None, None
 
         def build_vocab(self, word_counter: Counter):
-            self.w2i, self.i2w = {}, {}
+            self.w2i = OrderedDict({token: i for i, token in enumerate(self._special_tokens)})
+            self.i2w = OrderedDict()
 
-            pass
+            for key, value in word_counter.items():
+                if key not in self.w2i:
+                    self.w2i[key] = len(self.w2i)
 
-        def word_to_index(self):
-            pass
+            self.i2w = {self.w2i[k]:k for k in self.w2i}
+
+        def word_to_index(self, words):
+            return [self.w2i.get(word, self.w2i.get(self.unk_token)) for word in words]
+
+        def index_to_word(self, idx):
+            return [self.i2w.get(index, self.unk_token) for index in idx]
 
     def __init__(self, 
         is_shared_vocab: bool=True
@@ -97,39 +109,69 @@ class Processor:
             )
         )
 
+    def _abc(self, elements, max_len):
+        s = ['[BOS]']
+        for i, element in enumerate(elements):
+            s += [e for e in str(element)]
+            if i != len(elements)-1:
+                s+= ['[SEP]']
+        s += ['[EOS]']
+        
+        # compensate [PAD] to maximum lenth
+        s += ['[PAD]']*(max_len + 2 + (len(str(element))-1) - len(s))
+        return s
+
     def _process(self,
-        data_list: Iterable,
+        raw_group: Iterable,
+        pro_group,
+        name,
         max_len: int=None,
-        word_counter: Counter=None
+        word_counter: OrderedCounter=None
     ) -> Dataset:
+        data_list = raw_group[name]
         max_len = max_len or self._max_in_list(data_list)
+        # word_counter = word_counter or self.OrderedCounter()
         word_counter = word_counter or Counter()
+        
+        pro_group.create_dataset(
+            name,
+            (len(data_list), max_len),
+            dtype=np.int32
+        )
 
         for elements in data_list:
             # append [BOS] and [EOS] to tokenized 
-            s = ['[BOS]']
-            for i, element in enumerate(elements):
-                s += [e for e in str(element)]
-                if i != len(elements)-1:
-                    s+= ['[SEP]']
-            s += ['[EOS]']
+            s = self._abc(elements, max_len)
             
-            # compensate [PAD] to maximum lenth
-            s += ['[PAD]']*(max_len + 2 + (len(str(element))-1) - len(s))
-            
+            # update vocabulary
             word_counter.update(s)
+
+            # convert token to index
             
+        vocab = Processor.Vocabulary(
+            '[BOS]', '[EOS]', '[PAD]', '[UNK]'
+        )
+        vocab.build_vocab(
+            OrderedDict(sorted(word_counter.items()))
+        )
+
         return OrderedDict(sorted(word_counter.items()))
 
     def process(self, file_path):
         with h5py.File(file_path, "r") as f, \
             h5py.File("./processed.h5", "w") as pf:
             dataset_name = f.attrs['name']
-            data_group = f['data']
 
-            word_counter = self._process(data_group['operands'])
-            print(word_counter)
-            print(type(word_counter.keys()))
+            raw_data_group = f['data']
+            pdf_data_group = pf.create_group('data')
+
+            for name in raw_data_group:
+                # print(name)
+                word_counter = self._process(raw_data_group, pdf_data_group, name)
+
+                break
+            # print(word_counter)
+            # print(type(word_counter.keys()))
             # self._process(data_group['result'], word_counter=word_counter)
             # print(word_counter)
 
