@@ -91,6 +91,10 @@ class Processor:
     ):
         self.bos_token, self.eos_token = bos_token, eos_token
         self.pad_token, self.unk_token = pad_token, unk_token
+        self._special_tokens = [
+            self.bos_token, self.eos_token,
+            self.pad_token, self.unk_token
+        ]
         self.is_shared_vocab = is_shared_vocab
 
     def _tokenize(self, inp):
@@ -196,24 +200,21 @@ class Processor:
                     ds[i] = s
 
             vocab_group = pf.create_group('vocab')
-            if self.is_shared_vocab:
-                vocab_group.create_dataset('share_keys',
+            for name in ['share'] if self.is_shared_vocab else raw_data_group:
+                vocab_group.create_dataset(f'{name}_keys',
                     dtype=h5py.special_dtype(vlen=str),
-                    data=list(vocab_dict['share'].w2i.keys())
+                    data=list(vocab_dict[name].w2i.keys())
                 )
-                vocab_group.create_dataset('share_values',
-                    data=list(vocab_dict['share'].w2i.values())
+                vocab_group.create_dataset(f'{name}_values',
+                    # dtype=np.int32, # index number
+                    data=list(vocab_dict[name].i2w.values())
                 )
-            else:
-                for name in raw_data_group:
-                    vocab_group.create_dataset(f'{name}_keys',
-                        dtype=h5py.special_dtype(vlen=str),
-                        data=list(vocab_dict[name].w2i.keys())
-                    )
-                    vocab_group.create_dataset(f'{name}_values', data=list(vocab_dict[name].i2w.values()))
+                for token in self._special_tokens:
+                    vocab_group.attrs[token] = vocab_dict[name].word_to_index([token])[0]
 
+            # write info
             pf.attrs['name'] = f.attrs['name']
-            pf.attrs['length'] = len(raw_data_group[name])
+            # pf.attrs['length'] = 10
 
 
 def _gen(size, length, neg_prob=0.):
@@ -228,23 +229,23 @@ if __name__ == '__main__':
     b = _gen(10, 2, 0.25)
 
     # save raw dataset to h5
-    # with h5py.File("./raw_data.h5", "w") as fp:
-    #     fp.attrs['name'] = 'add'
+    with h5py.File("./raw_data.h5", "w") as fp:
+        fp.attrs['name'] = 'add'
 
-    #     data_group = fp.create_group('data')
-    #     data_group.attrs['size'] = a.shape[0]
-    #     data_group.attrs['length'] = 2
+        data_group = fp.create_group('data')
+        data_group.attrs['size'] = a.shape[0]
+        data_group.attrs['length'] = 2
 
-    #     data_group.create_dataset(
-    #         'operands',
-    #         shape=(10, 2),
-    #         data=np.stack([a, b], axis=-1)
-    #     )
-    #     data_group.create_dataset(
-    #         'result',
-    #         shape=(10, 1),
-    #         data=a + b
-    #     )
+        data_group.create_dataset(
+            'operands',
+            shape=(10, 2),
+            data=np.stack([a, b], axis=-1)
+        )
+        data_group.create_dataset(
+            'result',
+            shape=(10, 1),
+            data=a + b
+        )
 
     processor = Processor(
         '[BOS]', '[EOS]', '[PAD]', '[UNK]'

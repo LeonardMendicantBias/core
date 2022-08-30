@@ -57,10 +57,7 @@ class Net(nn.Module):
 
 class MHA(nn.Module):
 
-    def __init__(self,
-        d_model, num_heads,
-        dropout_prob
-    ):
+    def __init__(self, d_model, num_heads):
         self.d_model = d_model
         self.d_head = d_model // num_heads
         self.num_heads = num_heads
@@ -68,8 +65,6 @@ class MHA(nn.Module):
         self.query = nn.Linear(d_model, d_model)
         self.key = nn.Linear(d_model, d_model)
         self.value = nn.Linear(d_model, d_model)
-
-        self.dropout = nn.Dropout(dropout_prob)
         self.out = nn.Linear(d_model, d_model)
 
     def _attention(self, q, k, mask):
@@ -89,21 +84,143 @@ class MHA(nn.Module):
         q = self.query(q).view(b, -1, self.num_heads, self.d_head).transpose(1,2)
         v = self.value(v).view(b, -1, self.num_heads, self.d_head).transpose(1,2)
 
-        scores = self._attention(q, k, mask)
-        output = torch.matmul(scores, v).contiguous().view(b, -1, self.d_model)
+        score = self._attention(q, k, mask)
+        output = torch.matmul(score, v).contiguous().view(b, -1, self.d_model)
 
-        return self.out(output)
+        return self.out(output), score
 
         
 class FeedForward(nn.Module):
-    def __init__(self, d_model, d_ff=2048, dropout = 0.1):
+    def __init__(self, d_model):
         super().__init__() 
         # We set d_ff as a default to 2048
-        self.linear_1 = nn.Linear(d_model, d_ff)
-        self.dropout = nn.Dropout(dropout)
-        self.linear_2 = nn.Linear(d_ff, d_model)
+        self.linear_1 = nn.Linear(d_model, d_model*4)
+        self.activation = nn.ReLU()
+        self.linear_2 = nn.Linear(d_model*4, d_model)
     def forward(self, x):
-        x = self.dropout(F.relu(self.linear_1(x)))
+        x = self.linear_1(x)
+        x = self.activation(x)
         x = self.linear_2(x)
         return x
 
+
+class Layer(nn.Module):
+
+    def __init__(self,
+        d_model,
+        mha_head,
+        is_post_norm,
+        is_cross, mhca_head,
+        drop_prob=0.1
+    ):
+        self.d_model = d_model
+        self.is_post_norm = is_post_norm
+        self.is_cross = is_cross
+
+        self.mha = MHA(d_model, mha_head)
+        self.drop = nn.Dropout(drop_prob)
+        self.mha_norm = nn.LayerNorm(d_model)
+        self.ff = FeedForward(d_model)
+        self.ff_norm = nn.LayerNorm(d_model)
+
+        if is_cross:
+            self.mhca = MHA(d_model, mhca_head)
+            self.cdrop = nn.Dropout(drop_prob)
+            self.mhca_norm = nn.LayerNorm(d_model)
+            self.cff = FeedForward(d_model)
+            self.cff_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, x_=None):
+        # x = seq if self.is_post_norm else self.mha_norm(seq)
+        x, score = self.mha_norm(x + self.drop(self.mha(x, x, x)))
+        x = self.ff_norm(x + self.ff(x))
+
+        if x_ and self.is_cross:
+            x, cscore = self.mhca_norm(x + self.cdrop(self.mhca(x, x_, x_)))
+            x = self.cff_norm(x + self.cff(x))
+            return x, score, cscore
+        return x, score, None
+        
+
+class TransformerEncoder(nn.Module):
+
+    def __init__(self, n_layers, d_model, n_heads, is_post_norm):
+        super().__init__()
+        self.layers = nn.ModuleList([Layer(d_model, n_heads, is_post_norm, False, 0) for _ in n_layers])
+        
+    def forward(self):
+        scores = []
+        for layer in self.layers:
+            x, score, _ = layer(x)
+            scores.append(score.cpu().detach())
+        return x, scores
+
+
+class TransformerDecoder(nn.Module):
+
+    def __init__(self, n_layers, d_model, n_heads, is_post_norm, n_cheads):
+        super().__init__()
+        self.layers = nn.ModuleList([Layer(d_model, n_heads, is_post_norm, True, n_cheads) for _ in n_layers])
+        
+    def forward(self):
+        scores, cscores = [], []
+        for layer in self.layers:
+            x, score, cscore = layer(x)
+            scores.append(score.cpu().detach())
+            cscores.append(cscore.cpu().detach())
+        return x, scores, cscores
+
+
+class Transformer(nn.Module):
+
+    def __init__(self,
+        # vocab-related
+        enc_vocab: dict, dec_vocab: dict,
+        is_share_emb: bool,
+        # mha-related
+        d_model: int,
+        enc_head: int, enc_layers: int,
+        dec_head: int, dec_chead: int, dec_layers: int,
+        drop_prob: int=0.1,
+        # transformer-related
+        is_post_norm: bool=True,  # according to original Transformer architecture
+        is_enc_abs: bool=True, is_dec_abs: bool=True,
+    ):
+        super().__init__()
+        
+        if is_share_emb:
+            self.enc_emb = self.dec_emb = nn.Embedding(len(enc_vocab), d_model, enc_vocab.pad_token)
+        else:
+            self.enc_emb = nn.Embedding(len(enc_vocab), d_model, enc_vocab.pad_token)
+            self.dec_emb = nn.Embedding(len(dec_vocab), d_model, dec_vocab.pad_token)
+
+        self.enc_drop = nn.Dropout(drop_prob)
+        self.dec_drop = nn.Dropout(drop_prob)
+
+        self.enc_pos = None if is_enc_abs else nn.Identity()
+        self.dec_pos = None if is_dec_abs else nn.Identity()
+
+        self.encoder = nn.ModuleList([
+            Layer(d_model, enc_head, is_post_norm, False, 0) for _ in enc_layers
+        ])
+        self.decoder = nn.ModuleList([
+            Layer(d_model, dec_head, is_post_norm, True, dec_chead) for _ in dec_layers
+        ])
+
+        self.linear = nn.Linear(len(dec_vocab))
+    
+    def forward(self, inp_seq, out_seq):
+        inp_seq = self.enc_pos(self.enc_emb(inp_seq))
+        inp_seq = self.enc_drop(inp_seq)
+        out_seq = self.enc_pos(self.enc_emb(out_seq))
+        out_seq = self.dec_drop(out_seq)
+
+        enc_out, enc_scores = self.encoder(inp_seq)
+        dec_out, dec_scores, cross_scores = self.decoder(enc_out, out_seq)
+
+        logits = self.linear(dec_out)
+
+        return logits, enc_scores, dec_scores, cross_scores
+
+if __name__ == '__main__':
+    pass
