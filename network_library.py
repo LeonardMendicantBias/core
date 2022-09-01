@@ -58,6 +58,7 @@ class Net(nn.Module):
 class MHA(nn.Module):
 
     def __init__(self, d_model, num_heads):
+        super().__init__()
         self.d_model = d_model
         self.d_head = d_model // num_heads
         self.num_heads = num_heads
@@ -113,6 +114,7 @@ class Layer(nn.Module):
         is_cross, mhca_head,
         drop_prob=0.1
     ):
+        super().__init__()
         self.d_model = d_model
         self.is_post_norm = is_post_norm
         self.is_cross = is_cross
@@ -125,57 +127,67 @@ class Layer(nn.Module):
 
         if is_cross:
             self.mhca = MHA(d_model, mhca_head)
-            self.cdrop = nn.Dropout(drop_prob)
             self.mhca_norm = nn.LayerNorm(d_model)
             self.cff = FeedForward(d_model)
             self.cff_norm = nn.LayerNorm(d_model)
 
-    def forward(self, x, x_=None):
-        # x = seq if self.is_post_norm else self.mha_norm(seq)
-        x, score = self.mha_norm(x + self.drop(self.mha(x, x, x)))
-        x = self.ff_norm(x + self.ff(x))
+    def forward(self, x, x_e=None):
+        x_ = x if self.is_post_norm else self.mha_norm(x)
+        x, score = x + self.drop(self.mha(x_, x_, x_))
+        x = self.mha_norm(x) if self.is_post_norm else x
+            
+        x_ = x if self.is_post_norm else self.ff_norm(x)
+        x = x + self.ff(x_)
+        x = self.ff_norm(x) if self.is_post_norm else x
 
-        if x_ and self.is_cross:
-            x, cscore = self.mhca_norm(x + self.cdrop(self.mhca(x, x_, x_)))
-            x = self.cff_norm(x + self.cff(x))
+        if x_e and self.is_cross:
+            x_ = x if self.is_post_norm else self.mhca_norm(x)
+            x, cscore = x + self.drop(self.mhca(x_, x_e, x_e))
+            x = self.mhca_norm(x) if self.is_post_norm else x
+
+            x_ = x if self.is_post_norm else self.cff_norm(x)
+            x = x + self.cff(x_)
+            x = self.cff_norm(x) if self.is_post_norm else x
+
             return x, score, cscore
         return x, score, None
         
 
-class TransformerEncoder(nn.Module):
+# class TransformerEncoder(nn.Module):
 
-    def __init__(self, n_layers, d_model, n_heads, is_post_norm):
-        super().__init__()
-        self.layers = nn.ModuleList([Layer(d_model, n_heads, is_post_norm, False, 0) for _ in n_layers])
+#     def __init__(self, n_layers, d_model, n_heads, is_post_norm):
+#         super().__init__()
+#         self.layers = nn.ModuleList([Layer(d_model, n_heads, is_post_norm, False, 0) for _ in n_layers])
         
-    def forward(self):
-        scores = []
-        for layer in self.layers:
-            x, score, _ = layer(x)
-            scores.append(score.cpu().detach())
-        return x, scores
+#     def forward(self):
+#         scores = []
+#         for layer in self.layers:
+#             x, score, _ = layer(x)
+#             scores.append(score.cpu().detach())
+#         return x, scores
 
 
-class TransformerDecoder(nn.Module):
+# class TransformerDecoder(nn.Module):
 
-    def __init__(self, n_layers, d_model, n_heads, is_post_norm, n_cheads):
-        super().__init__()
-        self.layers = nn.ModuleList([Layer(d_model, n_heads, is_post_norm, True, n_cheads) for _ in n_layers])
+#     def __init__(self, n_layers, d_model, n_heads, is_post_norm, n_cheads):
+#         super().__init__()
+#         self.layers = nn.ModuleList([Layer(d_model, n_heads, is_post_norm, True, n_cheads) for _ in n_layers])
         
-    def forward(self):
-        scores, cscores = [], []
-        for layer in self.layers:
-            x, score, cscore = layer(x)
-            scores.append(score.cpu().detach())
-            cscores.append(cscore.cpu().detach())
-        return x, scores, cscores
+#     def forward(self):
+#         scores, cscores = [], []
+#         for layer in self.layers:
+#             x, score, cscore = layer(x)
+#             scores.append(score.cpu().detach())
+#             cscores.append(cscore.cpu().detach())
+#         return x, scores, cscores
 
 
 class Transformer(nn.Module):
 
     def __init__(self,
         # vocab-related
-        enc_vocab: dict, dec_vocab: dict,
+        enc_vocab_len: int, enc_vocab_pad: int,
+        dec_vocab_len: int, dec_vocab_pad: int,
         is_share_emb: bool,
         # mha-related
         d_model: int,
@@ -189,10 +201,10 @@ class Transformer(nn.Module):
         super().__init__()
         
         if is_share_emb:
-            self.enc_emb = self.dec_emb = nn.Embedding(len(enc_vocab), d_model, enc_vocab.pad_token)
+            self.enc_emb = self.dec_emb = nn.Embedding(enc_vocab_len, d_model, enc_vocab_pad)
         else:
-            self.enc_emb = nn.Embedding(len(enc_vocab), d_model, enc_vocab.pad_token)
-            self.dec_emb = nn.Embedding(len(dec_vocab), d_model, dec_vocab.pad_token)
+            self.enc_emb = nn.Embedding(enc_vocab_len, d_model, enc_vocab_pad)
+            self.dec_emb = nn.Embedding(dec_vocab_len, d_model, dec_vocab_pad)
 
         self.enc_drop = nn.Dropout(drop_prob)
         self.dec_drop = nn.Dropout(drop_prob)
@@ -201,13 +213,14 @@ class Transformer(nn.Module):
         self.dec_pos = None if is_dec_abs else nn.Identity()
 
         self.encoder = nn.ModuleList([
-            Layer(d_model, enc_head, is_post_norm, False, 0) for _ in enc_layers
+            Layer(d_model, enc_head, is_post_norm, False, -1) for _ in range(enc_layers)
         ])
         self.decoder = nn.ModuleList([
-            Layer(d_model, dec_head, is_post_norm, True, dec_chead) for _ in dec_layers
+            Layer(d_model, dec_head, is_post_norm, True, dec_chead) for _ in range(dec_layers)
         ])
 
-        self.linear = nn.Linear(len(dec_vocab))
+        self.linear = nn.Linear(d_model, dec_vocab_len)
+        self.linear_norm = nn.Identity() if is_post_norm else nn.LayerNorm(d_model)
     
     def forward(self, inp_seq, out_seq):
         inp_seq = self.enc_pos(self.enc_emb(inp_seq))
@@ -218,7 +231,7 @@ class Transformer(nn.Module):
         enc_out, enc_scores = self.encoder(inp_seq)
         dec_out, dec_scores, cross_scores = self.decoder(enc_out, out_seq)
 
-        logits = self.linear(dec_out)
+        logits = self.linear(self.linear_norm(dec_out))
 
         return logits, enc_scores, dec_scores, cross_scores
 
