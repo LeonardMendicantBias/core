@@ -1,14 +1,7 @@
 # %%
 
 # import h5py
-
-import encodings
-import enum
-from operator import le
 import os
-from posixpath import split
-from unittest import result
-from xml.dom.minidom import Element
 import h5py
 import numpy as np
 import pandas as pd
@@ -22,11 +15,20 @@ from torch.utils.data import Dataset, DataLoader
 from collections import Counter, OrderedDict
 from collections.abc import Iterable
 
+import torch
+from torch import nn
+import torch.cuda.amp as amp
+import torch.optim as optim
+from torch.nn.utils.rnn import pad_sequence
+
+import network_library
+
 
 @dataclass
 class DataList:
     inp: List[np.ndarray]
     out: List[np.ndarray]
+    file_path: str
     split: str
     name: str
     lengths: Tuple[int, int]
@@ -55,6 +57,7 @@ class DataList:
         data_list = cls(
             inp=group['inp'],
             out=group['out'],
+            file_path=group.file.filename,
             split=group.attrs['split'],
             name=group.attrs['name'],
             lengths=tuple(group.attrs['lengths'])
@@ -64,7 +67,6 @@ class DataList:
 
 @dataclass
 class Vocabulary:
-    
     bos_token: str
     eos_token: str
     sep_token: str
@@ -79,7 +81,7 @@ class Vocabulary:
     def __post_init__(self, word_counter):
         self._special_tokens = [
             self.bos_token, self.eos_token,
-            self.pad_token,
+            self.sep_token,
             self.pad_token, self.unk_token
         ]
 
@@ -114,27 +116,6 @@ class Vocabulary:
     @property
     def unk_idx(self) -> int:
         return self.w2i[self.unk_token]
-        
-    # @classmethod
-    # def build_from_dict(cls, vocab: dict):
-    #     self.w2i = vocab
-    #     self.i2w = {self.w2i[k]:k for k in self.w2i}
-        
-    #     return cls(
-    #         bos
-    #     )
-
-    # # write instance attributes under 'split' group under 'name' group
-    # def to_dataset(self, parent_group: h5py.Group):
-    #     split = parent_group.require_group('vocab')
-    #     group = split.require_group(self.name)
-
-    #     group.attrs['name'] = self.name
-    #     group.attrs['split'] = self.split
-    #     group.attrs['lengths'] = np.array(self.lengths)
-
-    #     group.create_dataset('inp', data=self.inp)
-    #     group.create_dataset('out', data=self.out)
 
     def word_to_index(self, words):
         return [self.w2i.get(word, self.w2i.get(self.unk_token)) for word in words]
@@ -147,6 +128,7 @@ class Vocabulary:
 class ProcessDataList:
     inp: List[str]
     out: List[str]
+    file_path: str
     split: str
     name: str
     lengths: Tuple[int, int]
@@ -172,10 +154,9 @@ class ProcessDataList:
             
             for key in counter_dict:
                 self.vocab_dict[key] = Vocabulary(
-                    '[BOS]', '[EOS]', '[PAD]', '[PAD]', '[UNK]',
+                    '[BOS]', '[EOS]', '[SEP]', '[PAD]', '[UNK]',
                     dict(sorted(counter_dict[key].items()))
                 )
-            print(self.vocab_dict[key].w2i)
         else:
             assert train_vocab_dict is not None, 'test split should inherit train split vocab'
             self.vocab_dict = train_vocab_dict
@@ -204,37 +185,51 @@ class ProcessDataList:
         return counter
 
     def to_dataset(self, parent_group: h5py.Group):
-        split = parent_group.require_group(self.split)
+        process_group = parent_group.require_group('process')
+        split = process_group.require_group(self.split)
         group = split.require_group(self.name)
 
+        # group.attrs['file_path'] = parent_group.attrs['file_path']
         group.attrs['name'] = self.name
         group.attrs['split'] = self.split
+        group.attrs['size'] = len(self)
         group.attrs['lengths'] = np.array(self.lengths)
 
-        group.create_dataset('inp', data=self.inp)
-        group.create_dataset('out', data=self.out)
+        group.create_dataset(
+            'inp',
+            dtype=h5py.vlen_dtype(np.dtype('int32')),
+            data=self.inp
+        )
+        group.create_dataset(
+            'out',
+            dtype=h5py.vlen_dtype(np.dtype('int32')),
+            data=self.out
+        )
         
     @classmethod
-    def from_datalist(cls, data_list: DataList, is_share_emb=False):
+    def from_datalist(cls, data_list: DataList, is_share_emb=False, train_vocab_dict=None):
         return cls(
             inp=data_list.inp,
             out=data_list.out,
+            file_path=data_list.file_path,
             split=data_list.split,
             name=data_list.name,
             lengths=data_list.lengths,
-            is_share_emb=is_share_emb
+            is_share_emb=is_share_emb,
+            train_vocab_dict=train_vocab_dict
         )
 
 
 class H5Dataset(Dataset):
 
-    def __init__(self, file_path, split='train'):
+    def __init__(self, file_path, split, name):
         self.file_path = file_path
         self.dataset = None
         self.split = split
+        self.name = name
 
         with h5py.File(file_path, "r") as f:
-            self.size = f['process'][split].attrs['size']
+            self.size = f['process'][split][name].attrs['size']
 
     def __del__(self):
         if self.dataset is not None:
@@ -246,135 +241,212 @@ class H5Dataset(Dataset):
     def __getitem__(self, idx):
         if self.dataset is None:
             self.dataset = self.dataset = h5py.File(self.file_path, 'r')#["dataset"]
-        data = self.dataset['process'][self.split]
+        data = self.dataset['process'][self.split][self.name]
 
-        return {data[name][idx] for name in data}
+        return {name: data[name][idx] for name in data}
+
+    @classmethod
+    def from_process_data(cls, process_data: ProcessDataList):
+        file_path = process_data.file_path
+        split = process_data.split
+        name = process_data.name
+        # vocab_dict = process_data.vocab_dict
+        return cls(file_path, split, name)
 
 
-class Processor:
+# class H5DataLoader(DataLoader):
 
-    def __init__(self, 
-        bos_token, eos_token,
-        pad_token, unk_token,
-        is_share_emb: bool=True
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
+
+#     @classmethod
+#     def from_h5dataset(cls, ds: H5Dataset):
+
+#         return cls(
+
+#         )
+
+class Trainer:
+
+    def __init__(self,
+        network: nn.Module,
+        train_set: Dataset, test_sets: List[Dataset],
+        n_train_steps, val_per_step, test_per_step,
+        enc_pad_idx, dec_pad_idx,
+        batch_size=256, num_workers=4,
+        drop_last=False,
+        iters_to_accumulate=1,
     ):
-        self.bos_token, self.eos_token = bos_token, eos_token
-        self.pad_token, self.unk_token = pad_token, unk_token
-        self._special_tokens = [
-            self.bos_token, self.eos_token,
-            self.pad_token, self.unk_token
-        ]
-        self.is_share_emb = is_share_emb
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.drop_last = drop_last
+        self.n_train_steps = n_train_steps
+        self.val_per_step = val_per_step
+        self.test_per_step = test_per_step
+        self.iters_to_accumulate = iters_to_accumulate
+        self.pad_idx_dict = {
+            'inp': enc_pad_idx,
+            'out': dec_pad_idx,
+        }
 
-    def _tokenize(self, inp):
-        return [s for s in str(inp)]
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            import torch.distributed as dist
+            dist.init_process_group(backend="nccl")
 
-    def _abc(self, elements, is_appd=False):
-        s = []
-        for i, element in enumerate(elements):
-            s += [e for e in str(element)]
-            if i != len(elements)-1 and is_appd:
-                s+= ['[SEP]']
-        if is_appd:
-            s = ['[BOS]'] + s + ['[EOS]']
-        return s
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+        self.is_distributed = self.local_world_size > 1
 
-    def process(self, file_path):
-        with h5py.File(file_path, "r+") as f:
-            raw_data_group = f['raw']
-            process_data_group = f.create_group('process')
-            process_train_data_group = process_data_group.create_group('train')
-            process_train_data_group.attrs['split'] = 'train'
+        self._is_log = (self.local_rank == 0)
+        if self._is_log:
+            print(f'start training on {self.local_world_size} GPUs {self.local_rank} {self.local_world_size}')
 
-            # preprocess
-            train_data_group = raw_data_group['train']
-            if self.is_share_emb:
-                c = Counter()
-                word_counter_dict = {name: c for name in train_data_group}
-            else:
-                word_counter_dict = {name: Counter() for name in train_data_group}
-            for name in train_data_group:
-                for elements in train_data_group[name]:
-                    s = self._abc(elements)
-                    word_counter_dict[name].update(s)
+        self.network = self._init_network(network)
+        self.train_loader = self._init_loader(train_set)
+        self.test_loaders = [self._init_loader(test_set) for test_set in test_sets]
+        
+    def _init_network(self, network: nn.Module):
+        network = network.to(self.local_rank)
+        return torch.nn.parallel.DistributedDataParallel(
+            network,
+            device_ids=[self.local_rank],
+            output_device=self.local_rank
+        ) if self.is_distributed else network
+        
+    def _collate_fn(self, batch):
+        inp = pad_sequence([torch.LongTensor(b['inp']) for b in batch], batch_first=True, padding_value=self.pad_idx_dict['inp'])
+        out = pad_sequence([torch.LongTensor(b['out']) for b in batch], batch_first=True, padding_value=self.pad_idx_dict['out'])
+        
+        return {
+            'inp': inp,
+            'out': out
+        }
 
-            vocab_dict = {}
-            vocab_group = process_train_data_group.create_group('vocab')
-            for name in train_data_group:
-                vocab = Vocabulary(
-                    self.bos_token, self.eos_token, self.pad_token, self.unk_token
-                )
-                vocab.build_vocab(
-                    OrderedDict(sorted(word_counter_dict[name].items()))
-                )
-                abc = vocab_group.create_group(name)
-                abc.create_dataset('word',
-                    dtype=h5py.string_dtype(encoding='utf-8'),
-                    data=list(vocab.w2i.keys())
-                )
-                abc.create_dataset('index',
-                    dtype=np.dtype('int32'),
-                    data=list(vocab.w2i.values())
-                )
+    def _init_loader(self, dataset: Dataset):
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            # shuffle=False if self.is_distributed else True,
+            shuffle=not self.is_distributed,
+            collate_fn=self._collate_fn,
+            # num_workers=0 if self.is_distributed else self.num_workers,
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=self.drop_last,
+            sampler=torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=self.local_world_size,
+                rank=self.local_rank
+            ) if self.is_distributed else None
+        )
+        
+    def start_training(self,
+        criterion_init,
+        optimizer_init,
+    ):
+        criterion = criterion_init(reduction='none', ignore_index=self.pad_idx_dict['out'])
+        optimizer = optimizer_init(self.network.parameters())
+        optimizer.zero_grad()  # just to make sure
 
-                vocab_dict[name] = vocab
-                    
-            # process_train_data_group.attrs['lengths'] = train_data_group.attrs['lengths']
-            for name in train_data_group:
-                # create h5-dataset for processed data
-                ds = process_train_data_group.create_dataset(
-                    name,
-                    shape=len(train_data_group[name]),
-                    dtype=h5py.vlen_dtype(np.dtype('int32'))
-                )
+        steps = 0
+        scaler = amp.GradScaler()
+        self.network.train()
+        max_epoch = 5
+        for epoch in range(max_epoch):
+            losses = []
+            for i, batch in enumerate(self.train_loader):
+                steps += 1
+                inputs, labels = batch.get('inp').to(self.local_rank), batch.get('out').to(self.local_rank)
 
-                for i, elements in enumerate(train_data_group[name]):
-                    s = self._abc(elements, True)
-                    ds[i] = vocab.word_to_index(s)
-
-            test_data_group = raw_data_group['test']
-            for name in test_data_group:
-                process_test_data_group = process_data_group.create_group(f'test-{name}')
-                process_test_data_group.attrs['lengths'] = test_data_group[name].attrs['lengths']
-                process_test_data_group.attrs['split'] = 'test'
-                d_group = test_data_group[name]
-                for n in d_group:
-                    ds = process_test_data_group.create_dataset(
-                        n,
-                        shape=len(d_group[n]),
-                        dtype=h5py.vlen_dtype(np.dtype('int32'))
+                # forward pass
+                with amp.autocast():
+                    logits, inp_scores, out_scores, out_cscores = self.network(inputs, labels[:, :-1])
+                    loss = criterion(
+                        logits.view(-1, logits.shape[-1]),
+                        labels[:, 1:].contiguous().view(-1)
                     )
+                    loss_ = loss.mean(0) / self.iters_to_accumulate
+                scaler.scale(loss_).backward()
 
-                    for i, elements in enumerate(d_group[n]):
-                        s = self._abc(elements, True)
-                        ds[i] = vocab_dict[n].word_to_index(s)
+                # batch accumulation
+                if (i + 1) % self.iters_to_accumulate == 0 or (i + 1 == len(self.train_loader)):
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.network.parameters(), 1.)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                losses.append((loss_*self.iters_to_accumulate).item())
 
-
-            # # metadata of dataset
-            # data_group.attrs['size'] = len(raw_data_group[name])
-
-    def read(self, file_path):
-        vocab_dict = {}
-        with h5py.File('./data.h5', "r") as f:
-            data = f['data']
-            vocab = data['vocab']
-
-            for name in data['vocab']:
-                enc_type = h5py.check_string_dtype(vocab[name]['word'].dtype).encoding
-                words = {
-                    k.decode(enc_type): v for k, v in zip(vocab[name]['word'], vocab[name]['index'])
-                }
+                if self._is_log:
+                    print(f'\r[{epoch + 1}, {max_epoch}] [{i}|{len(self.train_loader)}] loss: {np.mean(losses):.3f}', end='')
                 
-                # vocab_dict[name] = 
-                v = Vocabulary(
-                    self.bos_token, self.eos_token, self.pad_token, self.unk_token
+                # if steps % self.test_per_step == 0:
+            self.network.eval()
+            for test_loader in self.test_loaders:
+                for i, batch in enumerate(test_loader):
+                    with amp.autocast(), torch.no_grad():
+                        logits, inp_scores, out_scores, out_cscores = self.network(inputs, labels[:, :-1])
+                        pred = logits.argmax(-1)
+                        acc_per_token = pred.eq(labels[:, :-1])
+                        acc = acc_per_token.all(dim=-1)
+                    # print(acc)
+                    
+            self.network.train()
+                
+            if self._is_log:
+                print()
+    
+    @classmethod
+    def from_process_data(cls,
+        network_constructor: network_library.Transformer,
+        ds_file_path: str,
+        batch_size=256, num_workers=4,
+        iters_to_accumulate=1,
+    ):
+
+        with h5py.File(ds_file_path, "r+") as f:
+            raw = f['raw']
+            
+            group = raw['train']
+            for n, h5obj in group.items():
+                data_list = DataList.from_dataset(h5obj)
+                train_set = ProcessDataList.from_datalist(data_list, is_share_emb=True)
+                train_set.to_dataset(f)
+                vocab_dict = train_set.vocab_dict
+
+            group = raw['test']
+            test_sets = []
+            for n, h5obj in group.items():
+                data_list = DataList.from_dataset(h5obj)
+                test_set = ProcessDataList.from_datalist(
+                    data_list,
+                    is_share_emb=True,
+                    train_vocab_dict=vocab_dict
                 )
-                v.build_from_dict(words)
-                vocab_dict[name] = v
+                test_set.to_dataset(f)
+                test_sets.append(test_set)
 
-        dataset = H5Dataset(file_path)
+        network = network_constructor(
+            len(vocab_dict['inp']), vocab_dict['inp'].pad_idx,
+            len(vocab_dict['out']), vocab_dict['out'].pad_idx,
+            is_share_emb=True,
+            d_model=128,
+            enc_head=8, enc_layers=6,
+            dec_head=8, dec_chead=8, dec_layers=6,
+            # transformer-related
+            is_post_norm=True,  # according to original Transformer architecture
+            is_enc_abs=True, is_dec_abs=True,
+        )
 
-        return dataset, vocab_dict
+        train_dataset = H5Dataset.from_process_data(train_set)
+        train_datasets = [H5Dataset.from_process_data(test_set) for test_set in test_sets]
+
+        return cls(
+            network, train_dataset, train_datasets,
+            0, 0, 10,
+            vocab_dict['inp'].pad_idx, vocab_dict['out'].pad_idx,
+            batch_size, num_workers, False, iters_to_accumulate
+        )
 
 
 def _gen_add_neg(size: int, length: Tuple[int, int], neg_prob: float=0.):
@@ -389,15 +461,14 @@ def gen_data(size: int, length: Tuple[int, int], neg_prob: float=0.):
     b = _gen_add_neg(size, length, neg_prob)
     
     inp = np.stack([a, b], axis=-1)
-    out = (a+b)[..., np.newaxis]
+    out = inp.sum(-1, keepdims=True)
 
     return inp, out
-    
 
 
 if __name__ == '__main__':
     # RAW data
-    ds_size, length, neg_prob = 10, (0, 2), 0.25
+    ds_size, length, neg_prob = 100, (0, 2), 0.25
 
     # save raw dataset to h5
     with h5py.File("./data.h5", "w") as fp:
@@ -406,70 +477,25 @@ if __name__ == '__main__':
         raw_group = fp.create_group('raw')
 
         train_data = DataList(
-            *gen_data(ds_size, length, neg_prob), 
+            *gen_data(ds_size, length, neg_prob), fp.filename,
             'train', f'{length[0]}-{length[1]}', length
         )
         train_data.to_dataset(raw_group)
 
         for l in [3, 4]:
             test_data = DataList(
-                *gen_data(ds_size, length, neg_prob), 
+                *gen_data(ds_size, length, neg_prob), fp.filename,
                 'test', f'{l-1}-{l}', (l-1, l)
             )
             test_data.to_dataset(raw_group)
 
-    # processor = Processor(
-    #     '[BOS]', '[EOS]', '[PAD]', '[UNK]'
-    # )
-    # processor.process("./data.h5")
-
-    # processor = Processor(
-    #     '[BOS]', '[EOS]', '[PAD]', '[UNK]'
-    # )
-    # processor.read("./data.h5")
-
-    with h5py.File('./data.h5', "r") as f:
-        raw = f['raw']
-        # for name in raw:
-        group = raw['train']
-        for n, h5obj in group.items():
-            data_list = DataList.from_dataset(h5obj)
-            process_data_list = ProcessDataList.from_datalist(data_list, is_share_emb=True)
-            break
-            # break
-                
+    trainer = Trainer.from_process_data(
+        network_library.Transformer, "./data.h5",
+        batch_size=8
+    )
+    trainer.start_training(
+        nn.CrossEntropyLoss,
+        optim.Adam
+    )
 
 # %%
-
-if __name__ == '__main__':
-    with h5py.File('./data.h5', "r") as f:
-        raw = f['raw']
-        for name in raw:
-            for n in raw[name]:
-                print(name, n)
-        
-        # for name in vocab_group:
-        #     print(
-        #         type(vocab_group[name][0].decode('utf-8'))
-        #     )
-        #     break
-
-# %%
-
-if __name__ == '__main__':
-    ds = H5Dataset('/mount/viz/processed.h5')
-    loader = DataLoader(ds, batch_size=2, pin_memory=True, num_workers=2)
-    for batch in loader:
-        print(batch)
-
-    del loader
-    del ds
-# %%
-
-if __name__ == '__main__':
-    length, size = 2, 10
-    
-    a = np.random.randint(10**length, size=(size, 1))
-    b = np.random.randint(10**length, size=(size, 1))
-    print(np.concatenate([a, b], axis=-1))
-    print((a+b))

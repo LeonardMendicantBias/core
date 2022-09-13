@@ -1,24 +1,30 @@
 # %%
 
-import h5py
+from dataclasses import dataclass
+from typing import List
 import numpy as np
-from collections import Counter
-from dataclasses import MISSING, dataclass, InitVar, field
-from typing import Dict
+import inspect
+
 
 @dataclass
-class Data:
-    a: int = 1
-    b: int = 2
+class Parent:
+    abc: str
 
-    # def __post_init__(self):
-    def total(self):
-        return self.a+self.b
+    def __post_init__(self):
+        print('parent post init')
+
+    
+@dataclass
+class Child(Parent):
+    de: str
+
+    def __post_init__(self):
+        print('child post init')
 
 
 if __name__ == '__main__':
-    data = Data()
-    print(data.total)
-
+    child = Child(abc='abc', de='de')
+    print(child)
+    # inspect.getsource(child.__init__)
 
 # %%

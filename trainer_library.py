@@ -15,7 +15,9 @@ import numpy as np
 """
 class Trainer:
 
-    def __init__(self):
+    def __init__(self,
+        iters_to_accumulate=1
+    ):
         
         if torch.cuda.is_available() and torch.cuda.device_count() > 1:
             import torch.distributed as dist
@@ -24,7 +26,7 @@ class Trainer:
         self.local_rank = int(os.environ["LOCAL_RANK"])
         self.local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
 
-        self.iters_to_accumulate = 5
+        self.iters_to_accumulate = iters_to_accumulate
 
         self._is_log = self.local_rank == 0
         if self._is_log:
