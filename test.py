@@ -1,30 +1,31 @@
 # %%
 
-from dataclasses import dataclass
-from typing import List
+from functools import cached_property
+import h5py
 import numpy as np
-import inspect
 
 
-@dataclass
 class Parent:
-    abc: str
-
-    def __post_init__(self):
-        print('parent post init')
-
     
-@dataclass
-class Child(Parent):
-    de: str
+    def __init__(self, a, b, c):
+        self.a = a
+        self.b = b
+        self.c = c
 
-    def __post_init__(self):
-        print('child post init')
-
-
+    @cached_property
+    def total(self):
+        return self.a + self.b + self.c
+    
+    def abc(self):
+        return self.total
+    
 if __name__ == '__main__':
-    child = Child(abc='abc', de='de')
-    print(child)
-    # inspect.getsource(child.__init__)
+    kw = {
+        'a': 1,
+        'b': 2,
+    }
+
+    parent = Parent(**kw, c=3)
+    print(parent.abc())
 
 # %%

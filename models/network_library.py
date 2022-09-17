@@ -118,7 +118,7 @@ class MHA(nn.Module):
 
     def forward(self, q, k, v, mask=None):
         t = q.shape[1]
-        b, s, _ = k.shape
+        b, s, *_ = k.shape
 
         k = self.key(k).view(b, s, self.num_heads, self.d_head).transpose(1,2)
         q = self.query(q).view(b, t, self.num_heads, self.d_head).transpose(1,2)
@@ -155,7 +155,6 @@ class Transformer(nn.Module):
 
     def __init__(self,
         # vocab-related
-        name: str,
         enc_vocab_len: int, enc_pad_idx: int,
         dec_vocab_len: int, dec_pad_idx: int,
         is_share_emb: bool,
@@ -168,11 +167,7 @@ class Transformer(nn.Module):
         is_post_norm: bool=True,  # according to original Transformer architecture
         is_enc_abs: bool=True, is_dec_abs: bool=True,
     ):
-        assert (a:=d_model % enc_head) == 0, f"head dim of enc is not appropriate"
-        assert (a:=d_model % dec_chead) == 0, f"head dim of dec is not appropriate"
-
         super().__init__()
-        self.name = name
         self.d_model = d_model
         if is_share_emb:
             self.enc_emb = self.dec_emb = nn.Embedding(enc_vocab_len, d_model, padding_idx=enc_pad_idx)
@@ -216,12 +211,6 @@ class Transformer(nn.Module):
         logits = self.linear(self.linear_norm(out_seq))
 
         return logits, inp_scores, out_scores, out_cscores
-        # return {
-        #     'logits': logits,
-        #     'inp_scores': inp_scores,
-        #     'out_scores': out_scores,
-        #     'out_cscores': out_cscores,
-        # }
 
 if __name__ == '__main__':
     pass
