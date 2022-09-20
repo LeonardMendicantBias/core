@@ -70,24 +70,45 @@ class Layer(nn.Module):
             self.cff = FeedForward(d_model)
             self.cff_norm = nn.LayerNorm(d_model)
 
+    def post_norm(self, x, x_e):
+        x_ = x
+
+        x, score = self.mha(x, x, x)
+        x = x_ + x
+
+        x = self.mha_norm(x)
+
+    def pre_norm(self, x, x_e):
+        x_ = x
+
+        x = self.mha_norm(x)
+        x, score = self.mha(x, x, x)
+
+        x = x + x_
+        
+
     def forward(self, x, x_e=None):
-        x_ = x if self.is_post_norm else self.mha_norm(x)
-        x, score = self.mha(x_, x_, x_)
-        x = x + self.drop(x)
+        res_x = x
+        x = x if self.is_post_norm else self.mha_norm(x)
+        x, score = self.mha(x, x, x)
+        x = res_x + self.drop(x)
         x = self.mha_norm(x) if self.is_post_norm else x
-            
-        x_ = x if self.is_post_norm else self.ff_norm(x)
-        x = x + self.ff(x_)
+
+        res_x = x 
+        x = x if self.is_post_norm else self.ff_norm(x)
+        x = res_x + self.ff(x)
         x = self.ff_norm(x) if self.is_post_norm else x
 
         if x_e is not None and self.is_cross:
-            x_ = x if self.is_post_norm else self.mhca_norm(x)
-            x, cscore = self.mhca(x_, x_e, x_e)
-            x = x + self.drop(x)
+            res_x = x
+            x = x if self.is_post_norm else self.mhca_norm(x)
+            x, cscore = self.mhca(x, x_e, x_e)
+            x = res_x + self.drop(x)
             x = self.mhca_norm(x) if self.is_post_norm else x
 
-            x_ = x if self.is_post_norm else self.cff_norm(x)
-            x = x + self.cff(x_)
+            res_x = x
+            x = x if self.is_post_norm else self.cff_norm(x)
+            x = res_x + self.cff(x)
             x = self.cff_norm(x) if self.is_post_norm else x
 
             return x, score, cscore
@@ -128,27 +149,6 @@ class MHA(nn.Module):
         output = torch.matmul(score, v).contiguous().view(b, -1, self.d_model)
 
         return self.out(output), score
-
-
-@dataclass
-class TransformerConfig:
-    enc_vocab_len: int
-    enc_pad_idx: int
-    dec_vocab_len: int
-    dec_pad_idx: int
-    
-    is_share_emb: bool
-
-    enc_head: int
-    enc_layers: int
-    dec_head: int
-    dec_chead: int
-    dec_layers: int
-
-    drop_prob: int=0.1
-    is_post_norm: bool=True
-    is_enc_abs: bool=True
-    is_dec_abs: bool=True
 
 
 class Transformer(nn.Module):
@@ -216,12 +216,6 @@ class Transformer(nn.Module):
         logits = self.linear(self.linear_norm(out_seq))
 
         return logits, inp_scores, out_scores, out_cscores
-        # return {
-        #     'logits': logits,
-        #     'inp_scores': inp_scores,
-        #     'out_scores': out_scores,
-        #     'out_cscores': out_cscores,
-        # }
 
 if __name__ == '__main__':
     pass

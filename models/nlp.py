@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
-from .base import Pair, Split, Result, Task, Simulation
+from .base import Pair, Split, Result, Task, Simulation, Temp
 
 
 @dataclass
@@ -20,6 +20,7 @@ class Vocabulary:
     sep_token: str
     pad_token: str
     unk_token: str
+    dash_token: str
     token_counter: InitVar[Counter]
 
     # name: str=None
@@ -35,16 +36,16 @@ class Vocabulary:
         self._special_tokens = [
             self.bos_token, self.eos_token,
             self.sep_token,
-            self.pad_token, self.unk_token
+            self.pad_token, self.unk_token, self.dash_token
         ]
         
         if bool(token_counter):
             for i, token in enumerate(self._special_tokens):
                 self.w2i[token] = i
-                self.i2w[str(i)] = token
             for name in dict(sorted(token_counter.items())):  # alphabetic sort
                 self.w2i[name] = len(self.w2i)
-                self.i2w[str(len(self.w2i))] = name
+            for key, value in self.w2i.items():
+                self.i2w[str(value)] = key
         else:
             assert len(self.w2i) == len(self.i2w)
 
@@ -65,18 +66,19 @@ class Vocabulary:
     @property
     def unk_idx(self) -> int: return self.w2i[self.unk_token]
 
+    @property
+    def dash_idx(self) -> int: return self.w2i[self.dash_token]
+
     def word_to_index(self, words):
         return [self.w2i.get(w, self.unk_idx) for w in words]
 
     def index_to_word(self, idx):
-        return [self.i2w.get(i, self.unk_token) for i in idx]
+        return [self.i2w.get(str(i), self.unk_token) for i in idx]
 
 
 @dataclass
-class NLPPair(Pair):
-    
-    def to_arda(self):
-        return super().to_arda()
+class NLPTemp(Temp):
+    pass
 
 
 @dataclass
@@ -84,8 +86,13 @@ class NLPSplit(Split):
     inp_vocab: Vocabulary
     label_vocab: Vocabulary
 
-    def _gen_add_neg(size: int, lengths: Tuple[int, int], neg_prob: float=0.):
-        a = np.random.randint(10**lengths[0], 10**lengths[1], size=size)
+    def _gen_add_neg(size: int, n_digits: Tuple[int, int], neg_prob: float=0.):
+        # 10**0 = 1
+        # 10**1 = 10
+        # 10**2 = 100
+        # 10**3 = 1000
+        # (3, 3): [100, 1000) = [100, 999]
+        a = np.random.randint(10**(n_digits[0]-1), 10**n_digits[1], size=size)
         is_neg = np.random.choice([1, -1], size, p=[1.-neg_prob, neg_prob])
 
         return a * is_neg
@@ -112,7 +119,26 @@ class NLPSplit(Split):
         return counter
     
     def to_disk(self, h5_file: h5py.File) -> None:
-        super().to_disk(h5_file)
+        group = super().to_disk(h5_file)
+
+        dt = np.dtype([
+            ('index', np.dtype('int32')),
+            ('inp', h5py.vlen_dtype(h5py.string_dtype(encoding='utf-8'))),
+            ('label', h5py.vlen_dtype(h5py.string_dtype(encoding='utf-8'))),
+        ])
+        ds = group.create_dataset('raw', (len(self.data),), dtype=dt)
+        for i, sample in enumerate(self.data):
+            s = sample.to_disk()
+            inp = np.array([
+                a.encode('utf-8')
+                for a in self.inp_vocab.index_to_word(s[1])
+            ])
+            label = np.array([
+                a.encode('utf-8')
+                for a in self.label_vocab.index_to_word(s[2])
+            ])
+            ds[i] = (s[0], inp, label)
+
         if self.split == Split.SplitType.TRAIN:
             # TODO: write vocabularies to disk
             pass
@@ -120,6 +146,7 @@ class NLPSplit(Split):
     @classmethod
     def from_config(cls,
         size: int, lengths: Tuple[int, int],
+        max_length: int,
         split: Split.SplitType, name: str,
         inp_vocab=None, label_vocab=None,
         is_share_emb=True
@@ -131,6 +158,7 @@ class NLPSplit(Split):
                 'bos_token': '[BOS]', 'eos_token': '[EOS]',
                 'sep_token': '[SEP]',
                 'pad_token': '[PAD]', 'unk_token': '[UNK]',
+                'dash_token': '#',
             }
 
             inp_token_count = NLPSplit._count(inp)
@@ -141,22 +169,27 @@ class NLPSplit(Split):
             else:
                 inp_vocab = Vocabulary(**kw_dict, token_counter=inp_token_count)
                 label_vocab = Vocabulary(**kw_dict, token_counter=label_token_count)
-
+        
         def process(elements, vocab):
             s = [vocab.bos_token]
             for i, element in enumerate(elements):
-                s += [e for e in str(element)]
+                s += [vocab.dash_token]*(max_length - len(str(element))) + [e for e in str(element)]
+                
                 if i != len(elements)-1:
                     s+= [vocab.sep_token]
+            
             s += [vocab.eos_token]
             return np.array(vocab.word_to_index(s), dtype=np.int32)
-
+            # return s
+            
         assert inp_vocab is not None and label_vocab is not None, "Vocabularies should not be None"
+        
+        
         data = [
             Pair(i, process(o, inp_vocab), process(u, label_vocab))
             for i, (o, u) in enumerate(zip(inp, label))
         ]
-
+        
         return cls(
             data,
             split=split,
@@ -172,6 +205,16 @@ class NLPResult(Result):
 
     def to_disk(self) -> Tuple: return (self.idx, self.out, self.acc)
 
+    @classmethod
+    def from_train(cls, idx, pred, acc, vocab: Vocabulary):
+        return cls(
+            idx,
+            # vocab.index_to_word(pred),
+            np.array([word.encode('utf-8') for word in vocab.index_to_word(pred)]),
+            acc
+        )
+
+
 @dataclass
 class ADDTask(Task):
 
@@ -179,22 +222,29 @@ class ADDTask(Task):
         super().__post_init__()
     
     @classmethod
-    def from_config(cls,
-        train_size, train_lengths,
-        test_sizes, test_lengthss, 
+    def from_config(cls, 
+        train_config: Tuple[int, Tuple[int, int]],
+        val_config: List[Tuple[int, Tuple[int, int]]],
+        test_config: List[Tuple[int, Tuple[int, int]]],
     ):
+        max_length = train_config[1][1]
+        for config in val_config + test_config:
+            if (l:=config[1][1]) > max_length: max_length = l
+        max_length += 2  # overflow and negative sign
+        print('max_length', max_length)
+
         train_split = NLPSplit.from_config(
-            train_size, train_lengths,
-            Split.SplitType.TRAIN, f'{train_lengths[0]}-{train_lengths[1]}'
+            train_config[0], train_config[1], max_length,
+            Split.SplitType.TRAIN, f'{train_config[1][0]}-{train_config[1][1]}'
         )
         inp_vocab, label_vocab = train_split.inp_vocab, train_split.label_vocab
 
         test_splits=[
             NLPSplit.from_config(
-                size, lengths,
+                size, lengths, max_length,
                 Split.SplitType.TEST, f'{lengths[0]}-{lengths[1]}',
                 inp_vocab, label_vocab
-            ) for size, lengths in zip(test_sizes, test_lengthss)
+            ) for (size, lengths) in test_config
         ]
 
         return cls(
@@ -202,6 +252,7 @@ class ADDTask(Task):
             train_split=train_split,
             val_splits=[],
             test_splits=test_splits,
+            # test_splits=[],
         )
         
 
@@ -213,12 +264,11 @@ class NLPSimulation(Simulation):
 
         self.enc_pad_idx = self.task.train_split.inp_vocab.pad_idx
         self.dec_pad_idx = self.task.train_split.label_vocab.pad_idx
-
+        
         self.criterion = nn.CrossEntropyLoss(
-            reduction='none',
             ignore_index=self.dec_pad_idx
         ).cuda()#.to(self.device)
-        self.optimizer = torch.optim.Adam(self.network.parameters())#.to(self.device)
+        self.optimizer = torch.optim.Adam(self.network.parameters())
 
         self.result_cls = NLPResult
 
@@ -237,7 +287,6 @@ class NLPSimulation(Simulation):
         task: ADDTask,
         network_cls, network_name
     ):
-
         return cls(
             network_cls(
                 network_name,
@@ -250,10 +299,12 @@ class NLPSimulation(Simulation):
                 d_model=128,
                 enc_head=8, enc_layers=6,
                 dec_head=8, dec_chead=8, dec_layers=6,
+                #
+                is_post_norm=False
             ),
-            task, 
+            task,
             n_train_steps=1000, val_per_steps=1000, test_per_steps=1000,
-            batch_size=8
+            batch_size=256
         )
 
 # if __name__ == '__main__':

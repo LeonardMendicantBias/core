@@ -1,3 +1,4 @@
+import os
 from functools import cached_property
 import h5py
 from enum import Enum, unique
@@ -45,6 +46,8 @@ class Pair:
 
     def to_disk(self) -> Tuple: return (self.idx, self.inp, self.label)
 
+    def to_tuple(self) -> Tuple: return (self.idx, self.inp, self.label)
+
 
 @dataclass
 class Split:
@@ -70,7 +73,7 @@ class Split:
 
     @staticmethod
     def to_arda(ds_name, split, split_name) -> dict:
-        file_path = f'/mount/dataset/{ds_name}.h5'
+        file_path = f'/home/leonard/deep_learning/core/data/dataset/{ds_name}.h5'
         with h5py.File(file_path, 'r') as f:
             split = f[split.upper()]
             ds = split[split_name]
@@ -81,6 +84,42 @@ class Split:
                 'split': d['split'],
                 'size': str(d['size'])
             }
+    
+    @staticmethod
+    def to_arda_2(ds_name, split_name) -> dict:
+        data_path = f'/home/leonard/deep_learning/core/data/dataset/{ds_name}.h5'
+        ret_path = f'/home/leonard/deep_learning/core/data/result/{ds_name}.h5'
+        with h5py.File(data_path) as f, h5py.File(ret_path) as r:
+            data, ret = f['TEST'], r['TEST']
+            res = {
+                'data': {}
+            }
+
+            d_d, d_r = data[split_name], ret[split_name]
+            raw = d_d['raw'][:10]
+            raw_id, raw_inp, raw_label = raw['index'], raw['inp'], raw['label']
+
+            raw_inp = [[elem.decode('utf-8') for elem in elements] for elements in raw_inp]
+            raw_label = [[elem.decode('utf-8') for elem in elements] for elements in raw_label]
+            
+            for idx, inp, label in zip(raw_id, raw_inp, raw_label):
+                res['data'][str(idx)] = {
+                    'index': str(idx),
+                    'inp': inp,
+                    'label': label
+                }
+            networks = [net for net in ret[split_name]]
+            res['networks'] = networks
+            for net in networks:
+                best = d_r[net].attrs['best']
+                for sample in d_r[net][best]:
+                    if sample[0] in raw_id:
+                        # res[str(sample[0])][net] = {
+                        #     'pred': [elem.decode('utf-8') for elem in sample[1]],
+                        #     'acc': [elem.decode('utf-8') for elem in sample[2]],
+                        # }
+                        res['data'][str(sample[0])][net] = [elem.decode('utf-8') for elem in sample[1]]
+            return res
 
     def to_disk(self, h5_file: h5py.File) -> None:
         split = h5_file.require_group(self.split.name)
@@ -98,6 +137,8 @@ class Split:
         ds = group.create_dataset('data', (len(self.data),), dtype=dt)
         for i, sample in enumerate(self.data):
             ds[i] = sample.to_disk()
+        
+        return group
 
 
 @dataclass
@@ -129,7 +170,7 @@ class ResultSplit:  # ResultList?
             # ('out', h5py.vlen_dtype(np.dtype('int32'))),
 
             ('index', np.dtype('int32')),
-            ('out', h5py.vlen_dtype(np.dtype('int32'))),
+            ('pred', h5py.vlen_dtype(h5py.string_dtype(encoding='utf-8'))),
             ('acc', h5py.vlen_dtype(np.dtype('int32'))),
         ])
         ds = net.create_dataset(str(step_idx), (len(self.outputs),), dtype=dt)
@@ -138,16 +179,15 @@ class ResultSplit:  # ResultList?
         for i, sample in enumerate(outputs):
             s = sample.to_disk()
             ds[i] = s
-            acc.append(s[-1])
-        
-        if avg:=np.mean(acc) > net.attrs['acc']:
+            acc.append(np.prod(s[-1]))
+            
+        if (avg:=np.mean(acc)) >= net.attrs.get('acc', -1):
             net.attrs['acc'] = avg
             net.attrs['best'] = ds.ref
         
     def to_disk(self, h5_file: h5py.File):
-        assert (i:=len(self.split)) == (j:=len(self.outputs)), f"sizes should be equal but {i} and {j}"
-
-        # print(self.split)
+        # with h5py.File(f'/home/leonard/deep_learning/core/data/result/ADD.h5', 'w') as h5_file:
+            # print(self.split)
         split = h5_file.require_group(self.split.split.name)  # TRAIN
         ds = split.require_group(self.split.name)  # 4-4
         # TODO: 'ds' should reference the dataset 
@@ -168,39 +208,41 @@ class Task:
     test_dss: List[Type[Dataset]]=field(init=False, default_factory=list)
 
     def __post_init__(self):
-        self.file_path = f'/mount/dataset/{self.name}.h5'
+        self.file_path = f'/home/leonard/deep_learning/core/data/dataset/{self.name}.h5'
+        self.ret_path = f'/home/leonard/deep_learning/core/data/result/{self.name}.h5'
+
+        if os.path.exists(self.ret_path):
+            os.remove(self.ret_path)
+        
         self.to_disk()
 
         self.train_ds = self.train_split.ds(self.file_path)
         self.val_dss = [split.ds(self.file_path) for split in self.val_splits]
         self.test_dss = [split.ds(self.file_path) for split in self.test_splits]
 
-    # @cached_property
-    # def ds_file(self): return h5py.File(f'/mount/dataset/{self.name}.h5', 'w')
-
-    @cached_property
-    def ret_file(self): 
-        f = h5py.File(f'/mount/result/{self.name}.h5', 'w')
-        return f
-
     @staticmethod
     def to_arda(name) -> dict:
-        file_path = f'/mount/dataset/{name}.h5'
-        with h5py.File(file_path, 'r') as f:
-            train_split = f[Task.Split.SplitType.TRAIN.name]
-            train_split = list([s for s in train_split])
+        file_path = f'/home/leonard/deep_learning/core/data/dataset/{name}.h5'
+        ret_path = f'/home/leonard/deep_learning/core/data/result/{name}.h5'
+        with h5py.File(file_path) as f, h5py.File(ret_path) as r:
+            data = f[Split.SplitType.TEST.name]
+            ret = r[Split.SplitType.TEST.name]
+                
+            splits = []
+            for s in data:
+                
+                d_data = {key: str(value) for key, value in data[s].attrs.items()}
+                d_ret = {net: str(value.attrs['acc']) for net, value in ret[s].items()}
+                d_data['networks'] = [d_ret]
+                
+                splits.append(d_data)
 
-            # splits = f[Task.Split.SplitType.VAL]
-
-            test_splits = f[Task.Split.SplitType.TEST.name]
-            test_splits = list([s for s in test_splits])
-            
-        return {
-            'name': name,
-            'train': train_split,
-            # 'val': [split.name for split in self.val_splits],
-            'test': test_splits,
-        }
+            # return {
+            #     'name': name,
+            #     # 'val': [split.name for split in self.val_splits],
+            #     'splits': splits  # [s for s in test_splits],
+            # }
+            return splits
 
     def to_disk(self) -> None:
         with h5py.File(self.file_path, 'w') as f:
@@ -208,6 +250,9 @@ class Task:
             [split.to_disk(f) for split in self.val_splits]
             [split.to_disk(f) for split in self.test_splits]
 
+    def test_to_disk(self, result_split: ResultSplit):
+        with h5py.File(self.ret_path, 'a') as f:
+            result_split.to_disk(f)
 
 @dataclass
 class Simulation:
@@ -259,9 +304,10 @@ class Simulation:
         steps = 0
         scaler = amp.GradScaler()
         self.network.train()
-        max_epoch = 1
+        max_epoch = 2
         for epoch in range(max_epoch):
             losses = []
+            acc = []
             for i, batch in enumerate(self.train_loader):
                 steps += 1
                 # inputs, labels = batch.get('inp').to(self.device), batch.get('out').to(self.device)
@@ -274,9 +320,14 @@ class Simulation:
                         logits.view(-1, logits.shape[-1]),
                         labels[:, 1:].contiguous().view(-1)
                     )
-                    loss_ = loss.mean(0) / self.iters_to_accumulate
-                scaler.scale(loss_).backward()
+                    # loss_ = loss.mean(0) / self.iters_to_accumulate
 
+                    pred = logits.argmax(-1)
+                    acc_per_token = pred.eq(labels[:, 1:])
+                    a = acc_per_token.prod(dim=-1)
+                acc.extend(a.cpu().int().tolist())
+
+                scaler.scale(loss).backward()
                 # batch accumulation
                 if (i + 1) % self.iters_to_accumulate == 0 or (i + 1 == len(self.train_loader)):
                     scaler.unscale_(self.optimizer)
@@ -284,13 +335,12 @@ class Simulation:
                     scaler.step(self.optimizer)
                     scaler.update()
                     self.optimizer.zero_grad()
-                losses.append((loss_*self.iters_to_accumulate).item())
+                losses.append((loss*self.iters_to_accumulate).item())
 
-                if self._is_log:
-                    print(f'\r[{epoch + 1}, {max_epoch}] [{i+1}|{len(self.train_loader)}] loss: {np.mean(losses):.3f}', end='')
-                
-                # if steps % self.test_per_step == 0:
-            print()
+                if self._is_log:    
+                    print(f'\r[{epoch + 1}, {max_epoch}] [{i+1}|{len(self.train_loader)}] loss: {np.mean(losses):.3f} acc: {np.mean(acc):.3f}', end='')
+            #     break
+            # break
             self.network.eval()
             for j, test_loader in enumerate(self.test_loaders):
                 result_split = ResultSplit(
@@ -301,35 +351,26 @@ class Simulation:
                     with amp.autocast(), torch.no_grad():
                         logits, inp_scores, out_scores, out_cscores = self.network(inputs, labels[:, :-1])
                         pred = logits.argmax(-1)
-                        acc_per_token = pred.eq(labels[:, :-1])
-                        acc = acc_per_token.all(dim=-1)
-
-                        idx = batch.get('idx')
-                        
+                        acc_per_token = pred.eq(labels[:, 1:])
+                    
                     results = [
-                        self.result_cls(index, p, a) 
-                        for index, p, a in zip(
-                            idx,
+                        self.result_cls.from_train(idx, p, a, self.task.train_split.label_vocab)
+                        for idx, p, a in zip(
+                            batch.get('idx'),
                             pred.cpu().int().numpy(),
                             acc_per_token.cpu().int().numpy()
                         )
                     ]
                     result_split.add_batch(results)
 
-                    # print()
-                    # print(len(idx), idx)
-                    # print(len(pred.cpu()))
-                    # print(len(acc.cpu()))
-                    # print(acc)
-                
-                # print(acc_per_token.cpu().int())
-                result_split.to_disk(self.task.ret_file)
-                break
+                self.task.test_to_disk(result_split)
+                # result_split.to_disk(self.task.ret_file)
+                # result_split.to_disk()
+                # break
                     
             self.network.train()
                 
             if self._is_log:
                 print()
-            break
 
 
