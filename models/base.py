@@ -13,6 +13,10 @@ import torch.cuda.amp as amp
 
 
 class H5Dataset(Dataset):
+    '''
+        A PyTorch Dataset that reads HDF5
+            - support for multiple workers (num_worker > 0)
+    '''
 
     def __init__(self, file_path, split, name):
         self.file_path = file_path
@@ -23,14 +27,11 @@ class H5Dataset(Dataset):
             self.size = f[split][name].attrs['size']
 
     @cached_property
-    def dataset(self):
-        return h5py.File(self.file_path, 'r')[self.split][self.name]
+    def dataset(self): return h5py.File(self.file_path, 'r')[self.split][self.name]
 
     def __len__(self): return self.size
 
-    def __getitem__(self, idx):
-        data = self.dataset['data'][idx]
-        return data
+    def __getitem__(self, idx): return self.dataset['data'][idx]
 
 
 @dataclass
@@ -41,8 +42,6 @@ class Pair:
     label: np.ndarray
 
     # TODO: validate type of each sample in __post_init__
-
-    def to_arda(self) -> dict: raise NotImplementedError
 
     def to_disk(self) -> Tuple: return (self.idx, self.inp, self.label)
 
@@ -71,56 +70,6 @@ class Split:
             name=self.name,
         )
 
-    @staticmethod
-    def to_arda(ds_name, split, split_name) -> dict:
-        file_path = f'/home/leonard/deep_learning/core/data/dataset/{ds_name}.h5'
-        with h5py.File(file_path, 'r') as f:
-            split = f[split.upper()]
-            ds = split[split_name]
-            d = dict(ds.attrs).copy()
-
-            return {
-                'name': d['name'],
-                'split': d['split'],
-                'size': str(d['size'])
-            }
-    
-    @staticmethod
-    def to_arda_2(ds_name, split_name) -> dict:
-        data_path = f'/home/leonard/deep_learning/core/data/dataset/{ds_name}.h5'
-        ret_path = f'/home/leonard/deep_learning/core/data/result/{ds_name}.h5'
-        with h5py.File(data_path) as f, h5py.File(ret_path) as r:
-            data, ret = f['TEST'], r['TEST']
-            res = {
-                'data': {}
-            }
-
-            d_d, d_r = data[split_name], ret[split_name]
-            raw = d_d['raw'][:10]
-            raw_id, raw_inp, raw_label = raw['index'], raw['inp'], raw['label']
-
-            raw_inp = [[elem.decode('utf-8') for elem in elements] for elements in raw_inp]
-            raw_label = [[elem.decode('utf-8') for elem in elements] for elements in raw_label]
-            
-            for idx, inp, label in zip(raw_id, raw_inp, raw_label):
-                res['data'][str(idx)] = {
-                    'index': str(idx),
-                    'inp': inp,
-                    'label': label
-                }
-            networks = [net for net in ret[split_name]]
-            res['networks'] = networks
-            for net in networks:
-                best = d_r[net].attrs['best']
-                for sample in d_r[net][best]:
-                    if sample[0] in raw_id:
-                        # res[str(sample[0])][net] = {
-                        #     'pred': [elem.decode('utf-8') for elem in sample[1]],
-                        #     'acc': [elem.decode('utf-8') for elem in sample[2]],
-                        # }
-                        res['data'][str(sample[0])][net] = [elem.decode('utf-8') for elem in sample[1]]
-            return res
-
     def to_disk(self, h5_file: h5py.File) -> None:
         split = h5_file.require_group(self.split.name)
         group = split.require_group(self.name)
@@ -142,11 +91,48 @@ class Split:
 
 
 @dataclass
+class Task:
+    name: str
+
+    train_split: Type[Split]
+    val_splits: List[Type[Split]]=field(default_factory=list)
+    test_splits: List[Type[Split]]=field(default_factory=list)
+
+    train_ds: Type[Dataset]=field(init=False)
+    val_dss: List[Type[Dataset]]=field(init=False, default_factory=list)
+    test_dss: List[Type[Dataset]]=field(init=False, default_factory=list)
+
+    def __post_init__(self):
+        self.file_path = f'/home/leonard/deep_learning/core/data/dataset/{self.name}.h5'
+        self.ret_path = f'/home/leonard/deep_learning/core/data/result/{self.name}.h5'
+        
+        self.to_disk()
+
+        self.train_ds = self.train_split.ds(self.file_path)
+        self.val_dss = [split.ds(self.file_path) for split in self.val_splits]
+        self.test_dss = [split.ds(self.file_path) for split in self.test_splits]
+
+    def to_disk(self) -> None:
+        with h5py.File(self.file_path, 'w') as f:
+            if os.path.exists(self.ret_path):
+                os.remove(self.ret_path)
+
+            self.train_split.to_disk(f)
+            [split.to_disk(f) for split in self.val_splits]
+            [split.to_disk(f) for split in self.test_splits]
+
+    # def test_to_disk(self, result_split: ResultSplit):
+    #     with h5py.File(self.ret_path, 'a') as f:
+    #         result_split.to_disk(f)
+
+
+@dataclass
 class Result:
     idx: np.dtype('int32')
     out: np.ndarray
 
     def to_disk(self) -> Tuple: return (self.idx, self.out)
+
 
 @dataclass
 class ResultSplit:  # ResultList?
@@ -195,64 +181,6 @@ class ResultSplit:  # ResultList?
         # TODO: 'net' group should save reference to the best performance dataset
         self.write_output(self.outputs, net, self.step_idx)
 
-@dataclass
-class Task:
-    name: str
-
-    train_split: Type[Result]
-    val_splits: List[Type[Split]]=field(default_factory=list)
-    test_splits: List[Type[Split]]=field(default_factory=list)
-
-    train_ds: Type[Dataset]=field(init=False)
-    val_dss: List[Type[Dataset]]=field(init=False, default_factory=list)
-    test_dss: List[Type[Dataset]]=field(init=False, default_factory=list)
-
-    def __post_init__(self):
-        self.file_path = f'/home/leonard/deep_learning/core/data/dataset/{self.name}.h5'
-        self.ret_path = f'/home/leonard/deep_learning/core/data/result/{self.name}.h5'
-
-        if os.path.exists(self.ret_path):
-            os.remove(self.ret_path)
-        
-        self.to_disk()
-
-        self.train_ds = self.train_split.ds(self.file_path)
-        self.val_dss = [split.ds(self.file_path) for split in self.val_splits]
-        self.test_dss = [split.ds(self.file_path) for split in self.test_splits]
-
-    @staticmethod
-    def to_arda(name) -> dict:
-        file_path = f'/home/leonard/deep_learning/core/data/dataset/{name}.h5'
-        ret_path = f'/home/leonard/deep_learning/core/data/result/{name}.h5'
-        with h5py.File(file_path) as f, h5py.File(ret_path) as r:
-            data = f[Split.SplitType.TEST.name]
-            ret = r[Split.SplitType.TEST.name]
-                
-            splits = []
-            for s in data:
-                
-                d_data = {key: str(value) for key, value in data[s].attrs.items()}
-                d_ret = {net: str(value.attrs['acc']) for net, value in ret[s].items()}
-                d_data['networks'] = [d_ret]
-                
-                splits.append(d_data)
-
-            # return {
-            #     'name': name,
-            #     # 'val': [split.name for split in self.val_splits],
-            #     'splits': splits  # [s for s in test_splits],
-            # }
-            return splits
-
-    def to_disk(self) -> None:
-        with h5py.File(self.file_path, 'w') as f:
-            self.train_split.to_disk(f)
-            [split.to_disk(f) for split in self.val_splits]
-            [split.to_disk(f) for split in self.test_splits]
-
-    def test_to_disk(self, result_split: ResultSplit):
-        with h5py.File(self.ret_path, 'a') as f:
-            result_split.to_disk(f)
 
 @dataclass
 class Simulation:
@@ -343,9 +271,9 @@ class Simulation:
             # break
             self.network.eval()
             for j, test_loader in enumerate(self.test_loaders):
-                result_split = ResultSplit(
-                    steps, self.network.name, self.task.test_splits[j]
-                )
+                # result_split = ResultSplit(
+                #     steps, self.network.name, self.task.test_splits[j]
+                # )
                 for i, batch in enumerate(test_loader):
                     inputs, labels = batch.get('inp').cuda(), batch.get('label').cuda()
                     with amp.autocast(), torch.no_grad():
@@ -353,19 +281,17 @@ class Simulation:
                         pred = logits.argmax(-1)
                         acc_per_token = pred.eq(labels[:, 1:])
                     
-                    results = [
-                        self.result_cls.from_train(idx, p, a, self.task.train_split.label_vocab)
-                        for idx, p, a in zip(
-                            batch.get('idx'),
-                            pred.cpu().int().numpy(),
-                            acc_per_token.cpu().int().numpy()
-                        )
-                    ]
-                    result_split.add_batch(results)
+                #     results = [
+                #         self.result_cls.from_train(idx, p, a, self.task.train_split.label_vocab)
+                #         for idx, p, a in zip(
+                #             batch.get('idx'),
+                #             pred.cpu().int().numpy(),
+                #             acc_per_token.cpu().int().numpy()
+                #         )
+                #     ]
+                #     result_split.add_batch(results)
 
-                self.task.test_to_disk(result_split)
-                # result_split.to_disk(self.task.ret_file)
-                # result_split.to_disk()
+                # self.task.test_to_disk(result_split)
                 # break
                     
             self.network.train()

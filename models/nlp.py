@@ -77,29 +77,26 @@ class Vocabulary:
 
 
 @dataclass
-class NLPTemp(Temp):
-    pass
+class ADDTask(Task):
+    inp_vocab: Vocabulary=None
+    label_vocab: Vocabulary=None
 
-
-@dataclass
-class NLPSplit(Split):
-    inp_vocab: Vocabulary
-    label_vocab: Vocabulary
-
-    def _gen_add_neg(size: int, n_digits: Tuple[int, int], neg_prob: float=0.):
-        # 10**0 = 1
-        # 10**1 = 10
-        # 10**2 = 100
-        # 10**3 = 1000
-        # (3, 3): [100, 1000) = [100, 999]
-        a = np.random.randint(10**(n_digits[0]-1), 10**n_digits[1], size=size)
-        is_neg = np.random.choice([1, -1], size, p=[1.-neg_prob, neg_prob])
-
-        return a * is_neg
-
+    @staticmethod
     def gen_data(size: int, lengths: Tuple[int, int], neg_prob: float=0.):
-        a = NLPSplit._gen_add_neg(size, lengths, neg_prob)
-        b = NLPSplit._gen_add_neg(size, lengths, neg_prob)
+
+        def _gen_add_neg(size: int, n_digits: Tuple[int, int], neg_prob: float=0.):
+            # 10**0 = 1
+            # 10**1 = 10
+            # 10**2 = 100
+            # 10**3 = 1000
+            # (3, 3): [100, 1000) = [100, 999]
+            a = np.random.randint(10**(n_digits[0]-1), 10**n_digits[1], size=size)
+            is_neg = np.random.choice([1, -1], size, p=[1.-neg_prob, neg_prob])
+
+            return a * is_neg
+
+        a = _gen_add_neg(size, lengths, neg_prob)
+        b = _gen_add_neg(size, lengths, neg_prob)
         
         inp = np.stack([a, b], axis=-1)
         label = inp.sum(-1, keepdims=True)
@@ -114,62 +111,42 @@ class NLPSplit(Split):
         counter = Counter()
         for sample in elements:
             for sentence in sample:
-                for word in NLPSplit.tokenize(sentence):
+                for word in ADDTask.tokenize(sentence):
                     counter.update(word)
         return counter
     
-    def to_disk(self, h5_file: h5py.File) -> None:
-        group = super().to_disk(h5_file)
-
-        dt = np.dtype([
-            ('index', np.dtype('int32')),
-            ('inp', h5py.vlen_dtype(h5py.string_dtype(encoding='utf-8'))),
-            ('label', h5py.vlen_dtype(h5py.string_dtype(encoding='utf-8'))),
-        ])
-        ds = group.create_dataset('raw', (len(self.data),), dtype=dt)
-        for i, sample in enumerate(self.data):
-            s = sample.to_disk()
-            inp = np.array([
-                a.encode('utf-8')
-                for a in self.inp_vocab.index_to_word(s[1])
-            ])
-            label = np.array([
-                a.encode('utf-8')
-                for a in self.label_vocab.index_to_word(s[2])
-            ])
-            ds[i] = (s[0], inp, label)
-
-        if self.split == Split.SplitType.TRAIN:
-            # TODO: write vocabularies to disk
-            pass
-
+    def __post_init__(self):
+        super().__post_init__()
+    
     @classmethod
-    def from_config(cls,
-        size: int, lengths: Tuple[int, int],
-        max_length: int,
-        split: Split.SplitType, name: str,
-        inp_vocab=None, label_vocab=None,
+    def from_config(cls, 
+        train_config: Tuple[int, Tuple[int, int]],
+        val_configs: List[Tuple[int, Tuple[int, int]]],
+        test_configs: List[Tuple[int, Tuple[int, int]]],
         is_share_emb=True
-    ):  
-        inp, label = NLPSplit.gen_data(size, lengths, 0.25)
-        
-        if (inp_vocab is None and label_vocab is None) and split == Split.SplitType.TRAIN:
-            kw_dict = {
-                'bos_token': '[BOS]', 'eos_token': '[EOS]',
-                'sep_token': '[SEP]',
-                'pad_token': '[PAD]', 'unk_token': '[UNK]',
-                'dash_token': '#',
-            }
+    ):
+        train_raw_data = ADDTask.gen_data(train_config[0], train_config[1], 0.25)
+        kw_dict = {
+            'bos_token': '[BOS]', 'eos_token': '[EOS]',
+            'sep_token': '[SEP]',
+            'pad_token': '[PAD]', 'unk_token': '[UNK]',
+            'dash_token': '#',
+        }
+        inp_token_count = ADDTask._count(train_raw_data[0])
+        label_token_count = ADDTask._count(train_raw_data[1])
 
-            inp_token_count = NLPSplit._count(inp)
-            label_token_count = NLPSplit._count(label)
+        if is_share_emb:
+            inp_vocab = label_vocab = Vocabulary(**kw_dict, token_counter=inp_token_count + label_token_count)
+        else:
+            inp_vocab = Vocabulary(**kw_dict, token_counter=inp_token_count)
+            label_vocab = Vocabulary(**kw_dict, token_counter=label_token_count)
+
+        test_raw_datas = [ADDTask.gen_data(config[0], config[1], 0.25) for config in test_configs]
+
+        max_length = train_config[1][1]
+        for config in val_configs + test_configs:
+            if (length:=config[1][1]) > max_length: max_length = length
             
-            if is_share_emb:
-                inp_vocab = label_vocab = Vocabulary(**kw_dict, token_counter=inp_token_count + label_token_count)
-            else:
-                inp_vocab = Vocabulary(**kw_dict, token_counter=inp_token_count)
-                label_vocab = Vocabulary(**kw_dict, token_counter=label_token_count)
-        
         def process(elements, vocab):
             s = [vocab.bos_token]
             for i, element in enumerate(elements):
@@ -180,24 +157,77 @@ class NLPSplit(Split):
             
             s += [vocab.eos_token]
             return np.array(vocab.word_to_index(s), dtype=np.int32)
-            # return s
-            
-        assert inp_vocab is not None and label_vocab is not None, "Vocabularies should not be None"
-        
-        
-        data = [
-            Pair(i, process(o, inp_vocab), process(u, label_vocab))
-            for i, (o, u) in enumerate(zip(inp, label))
-        ]
-        
+
         return cls(
-            data,
-            split=split,
-            name=name,
-            inp_vocab=inp_vocab,
-            label_vocab=label_vocab,
+            'ADD_NEG',
+            train_split=Split([
+                    Pair(i, process(o, inp_vocab), process(u, label_vocab))
+                    for i, (o, u) in enumerate(train_raw_data)
+                ],
+                Split.SplitType.TRAIN, f'{train_config[1][0]}-{train_config[1][1]}'
+            ),
+            val_splits=[],
+            test_splits=[
+                Split([
+                    Pair(i, process(o, inp_vocab), process(u, label_vocab))
+                    for i, (o, u) in enumerate(raw_data)
+                ],
+                Split.SplitType.TRAIN, f'{config[1][0]}-{config[1][1]}'
+                )
+                for (raw_data, config) in zip(test_raw_datas, test_configs)
+            ]
         )
-        
+
+        # return cls(
+        #     'ADD_NEG',
+        #     train_split=NLPSplit.from_data_with_vocab(train_raw_data, Split.SplitType.TRAIN,
+        #         f'{train_config[1][0]}-{train_config[1][1]}',
+        #         max_length, inp_vocab, label_vocab
+        #     ),
+        #     val_splits=[],
+        #     test_splits=[
+        #         NLPSplit.from_data_with_vocab(raw_data, Split.SplitType.TEST, 
+        #             f'{config[1][0]}-{config[1][1]}',
+        #             max_length, inp_vocab, label_vocab
+        #         )
+        #         for (raw_data, config) in zip(test_raw_datas, test_configs)
+        #     ],
+        # )
+
+    # @classmethod
+    # def from_config(cls, 
+    #     train_config: Tuple[int, Tuple[int, int]],
+    #     val_config: List[Tuple[int, Tuple[int, int]]],
+    #     test_config: List[Tuple[int, Tuple[int, int]]],
+    # ):
+    #     max_length = train_config[1][1]
+    #     for config in val_config + test_config:
+    #         if (l:=config[1][1]) > max_length: max_length = l
+    #     max_length += 2  # overflow and negative sign
+    #     print('max_length', max_length)
+
+    #     train_split = NLPSplit.from_config(
+    #         train_config[0], train_config[1], max_length,
+    #         Split.SplitType.TRAIN, f'{train_config[1][0]}-{train_config[1][1]}'
+    #     )
+    #     inp_vocab, label_vocab = train_split.inp_vocab, train_split.label_vocab
+
+    #     test_splits=[
+    #         NLPSplit.from_config(
+    #             size, lengths, max_length,
+    #             Split.SplitType.TEST, f'{lengths[0]}-{lengths[1]}',
+    #             inp_vocab, label_vocab
+    #         ) for (size, lengths) in test_config
+    #     ]
+
+    #     return cls(
+    #         name='ADD',
+    #         train_split=train_split,
+    #         val_splits=[],
+    #         test_splits=test_splits,
+    #         # test_splits=[],
+    #     )
+  
 
 @dataclass
 class NLPResult(Result):
@@ -214,47 +244,6 @@ class NLPResult(Result):
             acc
         )
 
-
-@dataclass
-class ADDTask(Task):
-
-    def __post_init__(self):
-        super().__post_init__()
-    
-    @classmethod
-    def from_config(cls, 
-        train_config: Tuple[int, Tuple[int, int]],
-        val_config: List[Tuple[int, Tuple[int, int]]],
-        test_config: List[Tuple[int, Tuple[int, int]]],
-    ):
-        max_length = train_config[1][1]
-        for config in val_config + test_config:
-            if (l:=config[1][1]) > max_length: max_length = l
-        max_length += 2  # overflow and negative sign
-        print('max_length', max_length)
-
-        train_split = NLPSplit.from_config(
-            train_config[0], train_config[1], max_length,
-            Split.SplitType.TRAIN, f'{train_config[1][0]}-{train_config[1][1]}'
-        )
-        inp_vocab, label_vocab = train_split.inp_vocab, train_split.label_vocab
-
-        test_splits=[
-            NLPSplit.from_config(
-                size, lengths, max_length,
-                Split.SplitType.TEST, f'{lengths[0]}-{lengths[1]}',
-                inp_vocab, label_vocab
-            ) for (size, lengths) in test_config
-        ]
-
-        return cls(
-            name='ADD',
-            train_split=train_split,
-            val_splits=[],
-            test_splits=test_splits,
-            # test_splits=[],
-        )
-        
 
 @dataclass
 class NLPSimulation(Simulation):
